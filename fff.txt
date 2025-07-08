@@ -1,0 +1,4 @@
+
+TOKEN = "7764187384:AAHNjQIu7soAzDzgbRI6qfLM0czGekjhN-k"
+GOOGLE_SHEETS_CREDENTIALS = "credentials.json"  # Файл с ключами (см. инструкцию ниже)
+GOOGLE_SHEET_KEY = "1USOCOY37WTye411sMGmCDWUfx0IXRt7tCYfDVwxtRL0"     # ID вашей Google таблицы
