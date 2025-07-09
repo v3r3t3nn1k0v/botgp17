@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, List
 import gspread
+import sqlite3
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -31,6 +32,27 @@ TOKEN = "7764187384:AAHNjQIu7soAzDzgbRI6qfLM0czGekjhN-k"
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"  # Файл с ключами (см. инструкцию ниже)
 GOOGLE_SHEET_KEY = "1USOCOY37WTye411sMGmCDWUfx0IXRt7tCYfDVwxtRL0"     # ID вашей Google таблицы
 
+# Инициализация базы данных SQLite
+def init_db():
+    conn = sqlite3.connect('doctors_ratings.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS ratings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        doctor_id INTEGER NOT NULL,
+        doctor_name TEXT NOT NULL,
+        visited BOOLEAN NOT NULL,
+        rating INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # Инициализация бота и диспетчера
 bot = Bot(token=TOKEN)
@@ -43,6 +65,8 @@ dp.include_router(router)
 class Form(StatesGroup):
     doctor_name = State()
     select_doctor = State()
+    waiting_for_visit_answer = State()
+    waiting_for_rating = State()
 
 # Подключение к Google Sheets и обработка расписания
 class DoctorSchedule:
@@ -66,21 +90,16 @@ class DoctorSchedule:
     
     async def get_all_doctors(self) -> List[Dict]:
         """Получает список всех врачей из Google Sheets"""
-       
         try:
-            # Обновляем кэш не чаще чем раз в 5 минут
             result = [] 
             records = self.sheet.get_all_records()
-            print(records)
             for record in records:
-                print(record['фио врача'])
-                currdoc = { 'id': record['id врача'],
+                currdoc = { 
+                    'id': record['id врача'],
                     'name': record['фио врача'],
-                    'specialization': record['специализация']}
-                print(currdoc)
+                    'specialization': record['специализация']
+                }
                 result.append(currdoc)
-                currdoc = {}
-            print(result)
             return result
         except Exception as e:
             logger.error(f"Error getting doctors list: {e}")
@@ -119,7 +138,7 @@ class DoctorSchedule:
         if not schedule:
             return None
             
-        today = datetime.now().weekday()  # 0-пн, 1-вт, ..., 6-вс
+        today = datetime.now().weekday()
         days = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
         today_day = days[today]
         
@@ -134,6 +153,37 @@ class DoctorSchedule:
 # Инициализация модуля расписания
 doctor_schedule = DoctorSchedule()
 
+# Функции для работы с рейтингами
+def save_rating(user_id: int, doctor_id: int, doctor_name: str, visited: bool, rating: int = None):
+    conn = sqlite3.connect('doctors_ratings.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO ratings (user_id, doctor_id, doctor_name, visited, rating)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, doctor_id, doctor_name, visited, rating))
+    
+    conn.commit()
+    conn.close()
+
+def get_doctor_stats(doctor_id: int):
+    conn = sqlite3.connect('doctors_ratings.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT AVG(rating), COUNT(rating) 
+    FROM ratings 
+    WHERE doctor_id = ? AND visited = 1 AND rating IS NOT NULL
+    ''', (doctor_id,))
+    
+    avg_rating, count = cursor.fetchone()
+    conn.close()
+    
+    return {
+        'avg_rating': round(avg_rating, 1) if avg_rating else None,
+        'rating_count': count or 0
+    }
+
 # Клавиатуры
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
@@ -147,13 +197,30 @@ def get_main_keyboard():
     )
     return builder.as_markup(resize_keyboard=True)
 
+def get_visit_keyboard():
+    """Клавиатура для вопроса о посещении врача"""
+    builder = ReplyKeyboardBuilder()
+    builder.add(types.KeyboardButton(text="Да"))
+    builder.add(types.KeyboardButton(text="Нет"))
+    builder.adjust(2)  # Располагаем кнопки в 2 колонки
+    return builder.as_markup(resize_keyboard=True)
+
+def get_rating_keyboard():
+    """Клавиатура для оценки врача"""
+    builder = ReplyKeyboardBuilder()
+    builder.add(types.KeyboardButton(text="1"))
+    builder.add(types.KeyboardButton(text="2"))
+    builder.add(types.KeyboardButton(text="3"))
+    builder.add(types.KeyboardButton(text="4"))
+    builder.add(types.KeyboardButton(text="5"))
+    builder.adjust(5)  # Все 5 кнопок в один ряд
+    return builder.as_markup(resize_keyboard=True)
+
 async def get_doctors_keyboard():
     """Создает инлайн-клавиатуру со списком врачей"""
     doctors = await doctor_schedule.get_all_doctors()
     builder = InlineKeyboardBuilder()
-    print(f"Получено врачей: {len(doctors)}")
-    for doctor in doctors:
-        print(f"Врач: {doctor['name']}, ID: {doctor['id']}")
+    
     for doctor in doctors:
         builder.button(
             text=f"{doctor['name']} ({doctor['specialization']})", 
@@ -161,7 +228,6 @@ async def get_doctors_keyboard():
         )
     
     builder.adjust(1)
-    print(builder.as_markup())
     return builder.as_markup()
 
 # Обработчики команд
@@ -183,20 +249,36 @@ async def schedule_handler(message: types.Message):
     keyboard = await get_doctors_keyboard()
     await message.answer("Выберите врача из списка:", reply_markup=keyboard)
 
+@router.message(F.text == "Сегодняшнее расписание")
+async def today_schedule_handler(message: types.Message):
+    keyboard = await get_doctors_keyboard()
+    await message.answer("Выберите врача для просмотра расписания на сегодня:", reply_markup=keyboard)
+
 @router.callback_query(F.data.startswith("doctor_"))
-async def process_doctor_selection(callback: types.CallbackQuery):
+async def process_doctor_selection(callback: types.CallbackQuery, state: FSMContext):
     doctor_id = int(callback.data.split("_")[1])
     doctors = await doctor_schedule.get_all_doctors()
-    doctorInfo = {}
-    for doctor in doctors:
-        if int(doctor["id"]) == doctor_id:
-            doctorInfo = doctor
-            break
+    doctor = next((doc for doc in doctors if int(doc["id"]) == doctor_id), None)
     
     if doctor:
-        print(doctorInfo)
-        schedule = await doctor_schedule.get_schedule(doctorInfo['name'])
+        await state.update_data(doctor_id=doctor_id, doctor_name=doctor['name'])
+        
+        # Показываем расписание
+        schedule = await doctor_schedule.get_schedule(doctor['name'])
         if schedule:
+            # Добавляем статистику по оценкам
+            stats = get_doctor_stats(doctor_id)
+            stats_text = ""
+            if stats['avg_rating']:
+                stats_text = f"\n\n⭐ Средняя оценка: {stats['avg_rating']} (на основе {stats['rating_count']} оценок)"
+            
+            # Создаем inline-кнопку с ссылкой на Горздрав
+            builder = InlineKeyboardBuilder()
+            builder.add(types.InlineKeyboardButton(
+                text="Записаться на прием через Горздрав",
+                url="https://gorzdrav.spb.ru/"
+            ))
+            
             response = (
                 f"👨‍⚕️ Врач: {schedule['name']}\n"
                 f"📌 Специализация: {schedule['specialization']}\n\n"
@@ -208,93 +290,70 @@ async def process_doctor_selection(callback: types.CallbackQuery):
                 f"Пт: {schedule['schedule']['пт']}\n"
                 f"Сб: {schedule['schedule']['сб']}\n"
                 f"Вс: {schedule['schedule']['вс']}"
-            )
-        else:
-            response = f"Не удалось получить расписание для врача {doctor['name']}"
-    else:
-        response = "Врач не найден"
-    
-    await callback.message.edit_text(response)
-    await callback.answer()
-
-@router.message(F.text == "Сегодняшнее расписание")
-async def today_schedule_handler(message: types.Message):
-    keyboard = await get_doctors_keyboard()
-    await message.answer("Выберите врача для просмотра расписания на сегодня:", reply_markup=keyboard)
-
-@router.callback_query(F.data.startswith("doctor_"))
-async def process_doctor_selection(callback: types.CallbackQuery):
-    doctor_id = int(callback.data.split("_")[1])
-    doctors = await doctor_schedule.get_all_doctors()
-    doctorInfo = {}
-    for doctor in doctors:
-        if int(doctor["id"]) == doctor_id:
-            doctorInfo = doctor
-            break
-    
-    if doctorInfo:
-        print(doctorInfo)
-        schedule = await doctor_schedule.get_schedule(doctorInfo['name'])
-        if schedule:
-            # Создаем inline-кнопку с ссылкой на Горздрав
-            builder = InlineKeyboardBuilder()
-            builder.add(types.InlineKeyboardButton(
-                text="Записаться на прием через Горздрав",
-                url="https://gorzdrav.spb.ru/"
-            ))
-            
-            response = (
-                f"👨‍⚕️ Врач: {schedule['name']}\n"
-                f"📌 Специализация: {schedule['specialization']}\n\n"
-                "📅 Расписание:\n"
-                f"Пн: {schedule['schedule']['пн']}\n"
-                f"Вт: {schedule['schedule']['вт']}\n"
-                f"Ср: {schedule['schedule']['ср']}\n"
-                f"Чт: {schedule['schedule']['чт']}\n"
-                f"Пт: {schedule['schedule']['пт']}\n"
-                f"Сб: {schedule['schedule']['сб']}\n"
-                f"Вс: {schedule['schedule']['вс']}\n\n"
+                f"{stats_text}\n\n"
                 "Вы можете записаться на прием через Портал Горздрав:"
             )
             
             await callback.message.edit_text(response, reply_markup=builder.as_markup())
+            
+            # Предлагаем оценить врача
+            await callback.message.answer(
+                "Вы посещали этого врача? Оцените качество приема:",
+                reply_markup=get_visit_keyboard()
+            )
+            await state.set_state(Form.waiting_for_visit_answer)
         else:
-            await callback.message.edit_text(f"Не удалось получить расписание для врача {doctorInfo['name']}")
+            await callback.message.edit_text(f"Не удалось получить расписание для врача {doctor['name']}")
     else:
         await callback.message.edit_text("Врач не найден")
     
     await callback.answer()
 
-@router.callback_query(F.data.startswith("doctor_"))
-async def process_today_schedule(callback: types.CallbackQuery):
-    doctor_id = callback.data.split("_")[1]
-    doctors = await doctor_schedule.get_all_doctors()
-    doctor = next((doc for doc in doctors if doc['id'] == doctor_id), None)
+@router.message(Form.waiting_for_visit_answer)
+async def process_visit_answer(message: types.Message, state: FSMContext):
+    data = await state.get_data()
     
-    if doctor:
-        schedule = await doctor_schedule.get_today_schedule(doctor['name'])
-        if schedule:
-            # Создаем inline-кнопку с ссылкой на Горздрав
-            builder = InlineKeyboardBuilder()
-            builder.add(types.InlineKeyboardButton(
-                text="Записаться на прием через Горздрав",
-                url="https://gorzdrav.spb.ru/"
-            ))
-            
-            response = (
-                f"👨‍⚕️ Врач: {schedule['name']}\n"
-                f"📌 Специализация: {schedule['specialization']}\n\n"
-                f"📅 Сегодня ({schedule['today']}): {schedule['hours']}\n\n"
-                "Вы можете записаться на прием через Портал Горздрав:"
-            )
-            
-            await callback.message.edit_text(response, reply_markup=builder.as_markup())
-        else:
-            await callback.message.edit_text(f"Врач {doctor['name']} сегодня не принимает")
+    if message.text.lower() == 'да':
+        await message.answer(
+            "Пожалуйста, оцените качество приема (от 1 до 5):",
+            reply_markup=get_rating_keyboard()
+        )
+        await state.set_state(Form.waiting_for_rating)
+    elif message.text.lower() == 'нет':
+        save_rating(
+            user_id=message.from_user.id,
+            doctor_id=data['doctor_id'],
+            doctor_name=data['doctor_name'],
+            visited=False
+        )
+        await message.answer(
+            "Спасибо за ответ! Если посетите врача, оцените качество приема.",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
     else:
-        await callback.message.edit_text("Врач не найден")
-    
-    await callback.answer()
+        await message.answer("Пожалуйста, ответьте 'Да' или 'Нет'")
+
+@router.message(Form.waiting_for_rating)
+async def process_rating(message: types.Message, state: FSMContext):
+    if message.text.isdigit() and 1 <= int(message.text) <= 5:
+        data = await state.get_data()
+        
+        save_rating(
+            user_id=message.from_user.id,
+            doctor_id=data['doctor_id'],
+            doctor_name=data['doctor_name'],
+            visited=True,
+            rating=int(message.text)
+        )
+        
+        await message.answer(
+            "Спасибо за вашу оценку! Она поможет улучшить качество обслуживания.",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
+    else:
+        await message.answer("Пожалуйста, выберите оценку от 1 до 5")
 
 @router.message(F.text == "Контакты поликлиники")
 async def contacts_handler(message: types.Message):
