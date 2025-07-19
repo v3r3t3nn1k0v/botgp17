@@ -5,7 +5,7 @@ import sqlite3
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram import Router
@@ -14,6 +14,9 @@ from datetime import datetime
 import asyncio
 import platform
 import sys
+from texts import Messages
+from keyboards import beginningKeyboard, generateDoctorsInlineKeyboard , generateDoctorsInlineKeyboardWithSearch
+from database import initDatabase , setOrUpdateDoctorRecord
 
 # Настройка event loop для Windows
 if platform.system() == "Windows":
@@ -26,33 +29,16 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
+search_router = Router()
 # Конфигурация
 TOKEN = "7764187384:AAHNjQIu7soAzDzgbRI6qfLM0czGekjhN-k"
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"  # Файл с ключами (см. инструкцию ниже)
 GOOGLE_SHEET_KEY = "1USOCOY37WTye411sMGmCDWUfx0IXRt7tCYfDVwxtRL0"     # ID вашей Google таблицы
 
-# Инициализация базы данных SQLite
-def init_db():
-    conn = sqlite3.connect('doctors_ratings.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS ratings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        doctor_id INTEGER NOT NULL,
-        doctor_name TEXT NOT NULL,
-        visited BOOLEAN NOT NULL,
-        rating INTEGER,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
 
-init_db()
+initDatabase()
+
+
 
 # Инициализация бота и диспетчера
 bot = Bot(token=TOKEN)
@@ -67,91 +53,87 @@ class Form(StatesGroup):
     select_doctor = State()
     waiting_for_visit_answer = State()
     waiting_for_rating = State()
+    
 
+class DoctorSearch(StatesGroup):
+    waiting_for_surname = State()
 # Подключение к Google Sheets и обработка расписания
 class DoctorSchedule:
-    def __init__(self):
-        self.sheet = self.connect_to_google_sheets()
-        self.last_update = None
-        self.doctors_cache = []
+    def __init__(self, credentials_file: str, sheet_key: str):
+        """
+        Инициализация подключения к Google Sheets
         
-    def connect_to_google_sheets(self):
+        :param credentials_file: Путь к файлу с учетными данными Google API
+        :param sheet_key: Ключ Google Sheets документа
+        """
+        self.credentials_file = credentials_file
+        self.sheet_key = sheet_key
+        self.sheet = self._connect_to_google_sheets()
+    
+    def _connect_to_google_sheets(self):
+        """Устанавливает соединение с Google Sheets"""
         try:
             scope = [
                 "https://spreadsheets.google.com/feeds",
                 "https://www.googleapis.com/auth/drive"
             ]
-            creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS, scopes=scope)
+            creds = Credentials.from_service_account_file(
+                self.credentials_file, 
+                scopes=scope
+            )
             client = gspread.authorize(creds)
-            return client.open_by_key(GOOGLE_SHEET_KEY).sheet1
+            return client.open_by_key(self.sheet_key).sheet1
         except Exception as e:
             logger.error(f"Ошибка подключения к Google Sheets: {e}")
-            return None
+            raise
     
-    async def get_all_doctors(self) -> List[Dict]:
-        """Получает список всех врачей из Google Sheets"""
-        try:
-            result = [] 
-            records = self.sheet.get_all_records()
-            for record in records:
-                currdoc = { 
-                    'id': record['id врача'],
-                    'name': record['фио врача'],
-                    'specialization': record['специализация']
-                }
-                result.append(currdoc)
-            return result
-        except Exception as e:
-            logger.error(f"Error getting doctors list: {e}")
-            return []
-    
-    async def get_schedule(self, doctor_name: str) -> Dict:
-        """Получает расписание врача из Google Sheets"""
+    async def get_all_doctors_data(self) -> List[Dict]:
         try:
             records = self.sheet.get_all_records()
-            for row in records:
-                if row['фио врача'].lower() == doctor_name.lower():
-                    return await self.format_schedule(row)
-            return None
+            return [self._format_doctor_record(record) for record in records]
         except Exception as e:
-            logger.error(f"Error getting schedule: {e}")
-            return None
+            logger.error(f"Ошибка получения данных врачей: {e}")
+            raise
     
-    async def format_schedule(self, row: Dict) -> Dict:
-        """Форматирует расписание из строки таблицы"""
-        days = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-        schedule = {
-            'id': row['id врача'],
-            'name': row['фио врача'],
-            'specialization': row['специализация'],
-            'schedule': {}
-        }
-        
-        for day in days:
-            schedule['schedule'][day] = row.get(day, 'выходной')
-        
-        return schedule
-    
-    async def get_today_schedule(self, doctor_name: str) -> Dict:
-        """Получает расписание врача на сегодня"""
-        schedule = await self.get_schedule(doctor_name)
-        if not schedule:
-            return None
-            
-        today = datetime.now().weekday()
-        days = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-        today_day = days[today]
-        
-        return {
-            'id': schedule['id'],
-            'name': schedule['name'],
-            'specialization': schedule['specialization'],
-            'today': today_day,
-            'hours': schedule['schedule'][today_day]
-        }
+    def _format_doctor_record(self, record: Dict) -> Dict:
 
+        return {
+            'doctor_name': record['фио врача'],
+            'speciality' : record['специализация'], 
+            'mon': record.get('пн', 'выходной'),
+            'tue': record.get('вт', 'выходной'),
+            'wed': record.get('ср', 'выходной'),
+            'thu': record.get('чт', 'выходной'),
+            'fri': record.get('пт', 'выходной'),
+            'sat': record.get('сб', 'выходной'),
+            'sun': record.get('вс', 'выходной')
+        }
 # Инициализация модуля расписания
-doctor_schedule = DoctorSchedule()
+
+
+
+
+
+
+
+async def fillDoctorTable():
+    doctor_schedule = DoctorSchedule(GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_KEY)
+    doctors = await doctor_schedule.get_all_doctors_data()
+    for doctor in doctors:
+        setOrUpdateDoctorRecord(
+            doctor['doctor_name'], 
+            doctor['speciality'], 
+            doctor['mon'], 
+            doctor['tue'], 
+            doctor['wed'], 
+            doctor['thu'], 
+            doctor['fri'], 
+            doctor['sat'],
+            doctor['sun'],  )
+        
+
+
+asyncio.run(fillDoctorTable())
 
 # Функции для работы с рейтингами
 def save_rating(user_id: int, doctor_id: int, doctor_name: str, visited: bool, rating: int = None):
@@ -248,29 +230,59 @@ async def getFaq():
     return builder.as_markup()
 
 
-# Обработчики команд
 @router.message(CommandStart())
-@router.message(Command("help"))
-async def send_welcome(message: types.Message):
-    welcome_text = (
-        f"Здравствуйте, {message.from_user.first_name}!\n"
-        "Я - виртуальный помощник поликлиники. Чем могу помочь?\n\n"
-        "Выберите нужный вариант из меню ниже:\n"
-        "- Расписание врачей\n"
-        "- Сегодняшнее расписание\n"
-        "- Контакты поликлиники"
-    )
-    await message.reply(welcome_text, reply_markup=get_main_keyboard())
+async def sendWelcomeMessage(message: types.Message):
+    await bot.send_message(message.from_user.id , text=Messages.WELCOME_MESSAGE.format(name=message.from_user.first_name), reply_markup=beginningKeyboard)
+
+# Обработчики команд
+# @router.message(CommandStart())
+# @router.message(Command("help"))
+# async def send_welcome(message: types.Message):
+#     welcome_text = (
+#         f"Здравствуйте, {message.from_user.first_name}!\n"
+#         "Я - виртуальный помощник поликлиники. Чем могу помочь?\n\n"
+#         "Выберите нужный вариант из меню ниже:\n"
+#         "- Расписание врачей\n"
+#         "- Сегодняшнее расписание\n"
+#         "- Контакты поликлиники"
+#     )
+#     await message.reply(welcome_text, reply_markup=get_main_keyboard())
 
 @router.message(F.text == "Расписание врачей")
 async def schedule_handler(message: types.Message):
-    keyboard = await get_doctors_keyboard()
+    keyboard = generateDoctorsInlineKeyboard()
+    print(keyboard)
     await message.answer("Выберите врача из списка:", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("page_"))
+async def pagination_handler(callback: types.CallbackQuery):
+    """Обработчик переключения страниц"""
+    page = int(callback.data.split("_")[-1])
+    keyboard = generateDoctorsInlineKeyboard(page=page)
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "search_by_surname")
+async def start_surname_search(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите фамилию врача для поиска:")
+    await state.set_state(DoctorSearch.waiting_for_surname)
+    await callback.answer()
+
+@router.message(StateFilter(DoctorSearch.waiting_for_surname), F.text)
+async def process_surname_search(message: types.Message, state: FSMContext):
+    surname = message.text.strip()
+    keyboard = generateDoctorsInlineKeyboardWithSearch(surname)
+    await message.answer(text=f'Найденные врачи с фамилией {surname}:' , reply_markup=keyboard)
+
 
 @router.message(F.text == "Сегодняшнее расписание")
 async def today_schedule_handler(message: types.Message):
     keyboard = await get_doctors_keyboard()
     await message.answer("Выберите врача для просмотра расписания на сегодня:", reply_markup=keyboard)
+
+
+
 
 @router.callback_query(F.data.startswith("doctor_"))
 async def process_doctor_selection(callback: types.CallbackQuery, state: FSMContext):
